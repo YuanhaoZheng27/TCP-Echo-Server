@@ -10,12 +10,14 @@ Typical Linux usage:
     python3 tests/test_echo.py \
         --server-bin ./build-baseline/TcpServer \
         --strace required \
+        --artifact-dir /tmp/tcp-echo-baseline \
         -v
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -39,6 +41,8 @@ DEFAULT_PORT = 54000
 
 LARGE_PAYLOAD_BYTES = 8 * 1024 * 1024
 BACKPRESSURE_PAYLOAD_BYTES = 16 * 1024 * 1024
+BACKPRESSURE_SENDER_WAIT_SECONDS = 2.0
+BACKPRESSURE_SETTLE_SECONDS = 0.5
 CONCURRENT_CLIENT_COUNT = 32
 CONCURRENT_PAYLOAD_BYTES = 64 * 1024
 REPEATED_CONNECTION_COUNT = 200
@@ -60,31 +64,59 @@ def send_all(sock: socket.socket, data: bytes) -> None:
         view = view[sent:]
 
 
-def parse_send_calls(trace_text: str) -> Tuple[List[Tuple[int, int]], List[int]]:
-    """Return positive partial sends and line indices of send EAGAIN results."""
+def parse_send_calls(trace_text: str) -> Dict[str, object]:
+    """Analyze all send syscall records while tolerating strace flag layouts."""
     partial_sends: List[Tuple[int, int]] = []
     eagain_indices: List[int] = []
-    send_pattern = re.compile(
-        r"\b(?:sendto|send)\(.*?, (?P<length>\d+), MSG_NOSIGNAL\)"
-        r"\s+=\s+(?P<result>-?\d+)(?P<tail>.*)$"
-    )
+    other_error_indices: List[int] = []
+    send_line_indices: List[int] = []
+    full_send_count = 0
+    parsed_send_count = 0
+    call_pattern = re.compile(r"\b(?:sendto|send)\(")
+    head_pattern = re.compile(r"\b(?:sendto|send)\((.*)\)$")
+    length_pattern = re.compile(r",\s*(?P<length>\d+),\s*[^,]*\s*$")
+    result_pattern = re.compile(r"\s*(?P<result>-?\d+)(?P<tail>.*)$")
 
     for index, line in enumerate(trace_text.splitlines()):
-        match = send_pattern.search(line)
-        if not match:
+        if not call_pattern.search(line):
             continue
 
-        requested = int(match.group("length"))
-        result = int(match.group("result"))
-        tail = match.group("tail")
+        send_line_indices.append(index)
+        head, separator, result_text = line.rpartition(" = ")
+        if not separator:
+            continue
 
-        if 0 < result < requested:
+        head_match = head_pattern.search(head)
+        if not head_match:
+            continue
+
+        length_match = length_pattern.search(head_match.group(1))
+        result_match = result_pattern.match(result_text)
+        if not length_match or not result_match:
+            continue
+
+        parsed_send_count += 1
+        requested = int(length_match.group("length"))
+        result = int(result_match.group("result"))
+        tail = result_match.group("tail")
+
+        if result > 0 and result == requested:
+            full_send_count += 1
+        elif 0 < result < requested:
             partial_sends.append((requested, result))
-
-        if result == -1 and ("EAGAIN" in tail or "EWOULDBLOCK" in tail):
+        elif result == -1 and ("EAGAIN" in tail or "EWOULDBLOCK" in tail):
             eagain_indices.append(index)
+        elif result < 0:
+            other_error_indices.append(index)
 
-    return partial_sends, eagain_indices
+    return {
+        "send_line_count": len(send_line_indices),
+        "parsed_send_count": parsed_send_count,
+        "full_send_count": full_send_count,
+        "partial_sends": partial_sends,
+        "send_eagain_indices": eagain_indices,
+        "send_other_error_indices": other_error_indices,
+    }
 
 
 def port_is_available(port: int) -> bool:
@@ -122,6 +154,7 @@ class ManagedServer:
         self.trace_path = artifact_dir / "server.strace"
         self.process: Optional[subprocess.Popen] = None
         self.server_pid: Optional[int] = None
+        self.command: List[str] = []
         self._log_file = None
 
     def start(self) -> None:
@@ -139,14 +172,18 @@ class ManagedServer:
                     "-f",
                     "-tt",
                     "-s",
-                    "0",
+                    "16",
                     "-e",
-                    "trace=network,epoll_ctl,epoll_wait,close",
+                    (
+                        "trace=network,sendto,recvfrom,epoll_ctl,"
+                        "epoll_wait,close"
+                    ),
                     "-o",
                     str(self.trace_path),
                 ]
             )
         command.append(str(self.binary))
+        self.command = list(command)
 
         self._log_file = self.log_path.open("wb", buffering=0)
         try:
@@ -268,11 +305,18 @@ class ManagedServer:
             return "<server log unavailable>"
         return data.decode("utf-8", errors="replace")
 
-    def trace_text(self) -> str:
+    def trace_size(self) -> int:
         try:
-            return self.trace_path.read_text(encoding="utf-8", errors="replace")
+            return self.trace_path.stat().st_size
+        except OSError:
+            return 0
+
+    def trace_text(self, start_offset: int = 0) -> str:
+        try:
+            data = self.trace_path.read_bytes()
         except OSError:
             return ""
+        return data[start_offset:].decode("utf-8", errors="replace")
 
 
 @unittest.skipUnless(
@@ -290,15 +334,25 @@ class EchoIntegrationTests(unittest.TestCase):
     stop_timeout = 5.0
     strace_mode = "auto"
     strace_binary: Optional[str] = None
+    artifact_dir_override: Optional[Path] = None
+    backpressure_trace_offset: Optional[int] = None
 
     server: ManagedServer
-    artifacts: tempfile.TemporaryDirectory
+    artifacts: Optional[tempfile.TemporaryDirectory] = None
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.artifacts = tempfile.TemporaryDirectory(prefix="tcp-echo-tests-")
-        artifact_dir = Path(cls.artifacts.name)
+        cls.backpressure_trace_offset = None
+        if cls.artifact_dir_override is not None:
+            artifact_dir = cls.artifact_dir_override
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            cls.artifacts = None
+        else:
+            cls.artifacts = tempfile.TemporaryDirectory(prefix="tcp-echo-tests-")
+            artifact_dir = Path(cls.artifacts.name)
+        print("\nTest diagnostics directory: {}".format(artifact_dir), flush=True)
+
         cls.server = ManagedServer(
             binary=cls.server_binary,
             host=cls.host,
@@ -312,7 +366,8 @@ class EchoIntegrationTests(unittest.TestCase):
             cls.server.start()
         except BaseException:
             cls.server.stop()
-            cls.artifacts.cleanup()
+            if cls.artifacts is not None:
+                cls.artifacts.cleanup()
             raise
 
     @classmethod
@@ -320,7 +375,8 @@ class EchoIntegrationTests(unittest.TestCase):
         try:
             cls.server.stop()
         finally:
-            cls.artifacts.cleanup()
+            if cls.artifacts is not None:
+                cls.artifacts.cleanup()
             super().tearDownClass()
 
     def setUp(self) -> None:
@@ -404,19 +460,33 @@ class EchoIntegrationTests(unittest.TestCase):
             chunks.append(chunk)
 
     def echo_while_sending(
-        self, sock: socket.socket, payload: bytes, hold_before_read: float = 0.0
+        self,
+        sock: socket.socket,
+        payload: bytes,
+        hold_before_read: float = 0.0,
+        wait_for_sender_before_read: bool = False,
     ) -> bytes:
         """Send in one thread while receiving in the main test thread."""
         sender_errors: List[BaseException] = []
+        sender_finished = threading.Event()
 
         def sender() -> None:
             try:
                 send_all(sock, payload)
             except BaseException as exc:
                 sender_errors.append(exc)
+            finally:
+                sender_finished.set()
 
         sender_thread = threading.Thread(target=sender, daemon=True)
         sender_thread.start()
+
+        if wait_for_sender_before_read:
+            sender_finished.wait(
+                timeout=min(
+                    self.workload_timeout, BACKPRESSURE_SENDER_WAIT_SECONDS
+                )
+            )
 
         if hold_before_read > 0:
             time.sleep(hold_before_read)
@@ -665,6 +735,7 @@ class EchoIntegrationTests(unittest.TestCase):
         # server's outgoing path to encounter backpressure. Sending happens in
         # another thread while the main thread reads, so neither side can
         # deadlock by waiting for the other to make progress first.
+        type(self).backpressure_trace_offset = self.server.trace_size()
         payload = (
             b"0123456789abcdef"
             * ((BACKPRESSURE_PAYLOAD_BYTES + 15) // 16)
@@ -672,38 +743,37 @@ class EchoIntegrationTests(unittest.TestCase):
 
         with self.connection(receive_buffer=4096) as sock:
             received = self.echo_while_sending(
-                sock, payload, hold_before_read=0.5
+                sock,
+                payload,
+                hold_before_read=BACKPRESSURE_SETTLE_SECONDS,
+                wait_for_sender_before_read=True,
             )
 
         self.assertEqual(len(received), len(payload))
         self.assertEqual(received, payload)
 
     def collect_trace_evidence(
-        self,
-    ) -> Tuple[List[Tuple[int, int]], List[int], int, List[int], str]:
-        trace_text = self.server.trace_text()
-        partial_sends, send_eagain_indices = parse_send_calls(trace_text)
-        recv_eagain_count = sum(
-            1
-            for line in trace_text.splitlines()
+        self, start_offset: int = 0
+    ) -> Tuple[Dict[str, object], str]:
+        trace_text = self.server.trace_text(start_offset)
+        lines = trace_text.splitlines()
+        evidence = parse_send_calls(trace_text)
+        evidence["trace_line_count"] = len(lines)
+        evidence["recv_eagain_indices"] = [
+            index
+            for index, line in enumerate(lines)
             if "recvfrom(" in line
             and "= -1" in line
             and ("EAGAIN" in line or "EWOULDBLOCK" in line)
-        )
-        epollout_updates = [
+        ]
+        evidence["epollout_update_indices"] = [
             index
-            for index, line in enumerate(trace_text.splitlines())
+            for index, line in enumerate(lines)
             if "epoll_ctl(" in line
             and "EPOLL_CTL_MOD" in line
             and "EPOLLOUT" in line
         ]
-        return (
-            partial_sends,
-            send_eagain_indices,
-            recv_eagain_count,
-            epollout_updates,
-            trace_text,
-        )
+        return evidence, trace_text
 
     def test_12_straced_internal_paths(self) -> None:
         if not self.server.strace_path:
@@ -712,80 +782,148 @@ class EchoIntegrationTests(unittest.TestCase):
                 "was not verified"
             )
 
-        (
-            partial_sends,
-            send_eagain_indices,
-            recv_eagain_count,
-            epollout_updates,
-            _,
-        ) = self.collect_trace_evidence()
+        trace_offset = type(self).backpressure_trace_offset
+        if trace_offset is None:
+            trace_offset = self.server.trace_size()
+            type(self).backpressure_trace_offset = trace_offset
+
+        evidence, trace_text = self.collect_trace_evidence(trace_offset)
 
         deadline = time.monotonic() + min(self.io_timeout, 5.0)
         while time.monotonic() < deadline:
-            if send_eagain_indices and epollout_updates:
+            if evidence["send_eagain_indices"] and evidence[
+                "epollout_update_indices"
+            ]:
                 break
             time.sleep(0.1)
-            (
-                partial_sends,
-                send_eagain_indices,
-                recv_eagain_count,
-                epollout_updates,
-                _,
-            ) = self.collect_trace_evidence()
+            evidence, trace_text = self.collect_trace_evidence(trace_offset)
 
         # Do not depend on unittest method ordering. If earlier tests did not
         # produce trace evidence, repeat the workload here.
-        if not send_eagain_indices or not epollout_updates:
+        if not evidence["send_eagain_indices"] or not evidence[
+            "epollout_update_indices"
+        ]:
+            trace_offset = self.server.trace_size()
+            type(self).backpressure_trace_offset = trace_offset
             payload = (
                 b"0123456789abcdef"
                 * ((BACKPRESSURE_PAYLOAD_BYTES + 15) // 16)
             )[:BACKPRESSURE_PAYLOAD_BYTES]
             with self.connection(receive_buffer=4096) as sock:
                 received = self.echo_while_sending(
-                    sock, payload, hold_before_read=0.5
+                    sock,
+                    payload,
+                    hold_before_read=BACKPRESSURE_SETTLE_SECONDS,
+                    wait_for_sender_before_read=True,
                 )
             self.assertEqual(received, payload)
 
             deadline = time.monotonic() + min(self.io_timeout, 5.0)
             while time.monotonic() < deadline:
-                (
-                    partial_sends,
-                    send_eagain_indices,
-                    recv_eagain_count,
-                    epollout_updates,
-                    _,
-                ) = self.collect_trace_evidence()
-                if send_eagain_indices and epollout_updates:
+                evidence, trace_text = self.collect_trace_evidence(trace_offset)
+                if evidence["send_eagain_indices"] and evidence[
+                    "epollout_update_indices"
+                ]:
                     break
                 time.sleep(0.1)
 
+        send_eagain_indices = evidence["send_eagain_indices"]
+        epollout_updates = evidence["epollout_update_indices"]
         eagain_then_epollout = any(
             eagain_index < epollout_index <= eagain_index + 50
             for eagain_index in send_eagain_indices
             for epollout_index in epollout_updates
         )
 
+        trace_lines = trace_text.splitlines()
+        send_samples = [
+            line for line in trace_lines if re.search(r"\b(?:sendto|send)\(", line)
+        ][-20:]
+        send_eagain_samples = [
+            line
+            for line in trace_lines
+            if re.search(r"\b(?:sendto|send)\(", line)
+            and ("EAGAIN" in line or "EWOULDBLOCK" in line)
+        ][-20:]
+        epollout_samples = [
+            line
+            for line in trace_lines
+            if "epoll_ctl(" in line
+            and "EPOLL_CTL_MOD" in line
+            and "EPOLLOUT" in line
+        ][-20:]
+        summary_path = self.server.artifact_dir / "trace-evidence.json"
+        summary = {
+            "trace_path": str(self.server.trace_path),
+            "server_log_path": str(self.server.log_path),
+            "server_command": self.server.command,
+            "trace_offset": trace_offset,
+            "trace_line_count": evidence["trace_line_count"],
+            "send_line_count": evidence["send_line_count"],
+            "parsed_send_count": evidence["parsed_send_count"],
+            "full_send_count": evidence["full_send_count"],
+            "partial_send_count": len(evidence["partial_sends"]),
+            "partial_sends": evidence["partial_sends"][:20],
+            "send_eagain_count": len(send_eagain_indices),
+            "send_other_error_count": len(
+                evidence["send_other_error_indices"]
+            ),
+            "recv_eagain_count": len(evidence["recv_eagain_indices"]),
+            "epollout_mod_count": len(epollout_updates),
+            "eagain_then_epollout": eagain_then_epollout,
+            "send_samples": send_samples,
+            "send_eagain_samples": send_eagain_samples,
+            "epollout_samples": epollout_samples,
+            "trace_tail": trace_lines[-40:],
+        }
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+
         print(
-            "\n[strace evidence] partial sends={}, send EAGAIN={}, "
-            "recv EAGAIN={}, EPOLLOUT MOD={}".format(
-                len(partial_sends),
+            "\n[strace evidence] send lines={}, parsed sends={}, full sends={}, "
+            "partial sends={}, send EAGAIN={}, recv EAGAIN={}, EPOLLOUT MOD={}"
+            "\nRaw trace: {}\nSummary: {}\nServer log: {}".format(
+                evidence["send_line_count"],
+                evidence["parsed_send_count"],
+                evidence["full_send_count"],
+                len(evidence["partial_sends"]),
                 len(send_eagain_indices),
-                recv_eagain_count,
+                len(evidence["recv_eagain_indices"]),
                 len(epollout_updates),
+                self.server.trace_path,
+                summary_path,
+                self.server.log_path,
             )
         )
 
         self.assertTrue(
+            evidence["partial_sends"],
+            "no positive partial send was observed; the server accepted either "
+            "the complete request or no bytes before EAGAIN; raw trace: {}".format(
+                self.server.trace_path
+            ),
+        )
+        self.assertTrue(
             send_eagain_indices,
-            "no send EAGAIN was observed; the backpressure path was not verified",
+            "no send EAGAIN was observed; send lines={}, parsed sends={}; "
+            "raw trace: {}".format(
+                evidence["send_line_count"],
+                evidence["parsed_send_count"],
+                self.server.trace_path,
+            ),
         )
         self.assertTrue(
             epollout_updates,
-            "no EPOLLOUT update was observed",
+            "no EPOLLOUT update was observed; raw trace: {}".format(
+                self.server.trace_path
+            ),
         )
         self.assertTrue(
             eagain_then_epollout,
-            "send EAGAIN was not followed by an EPOLLOUT EPOLL_CTL_MOD",
+            "send EAGAIN was not followed by an EPOLLOUT EPOLL_CTL_MOD; "
+            "raw trace: {}".format(self.server.trace_path),
         )
 
 
@@ -843,6 +981,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "run the server under strace for internal-path evidence; "
             "auto uses strace when installed (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        default=None,
+        help=(
+            "preserve server.log, raw server.strace, and trace-evidence.json "
+            "in this directory"
         ),
     )
     parser.add_argument(
@@ -907,6 +1054,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     EchoIntegrationTests.strace_mode = args.strace
     EchoIntegrationTests.strace_binary = (
         strace_binary if args.strace != "off" else None
+    )
+    EchoIntegrationTests.artifact_dir_override = (
+        args.artifact_dir.expanduser().resolve()
+        if args.artifact_dir is not None
+        else None
     )
 
     suite = loader.loadTestsFromTestCase(EchoIntegrationTests)
