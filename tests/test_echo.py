@@ -47,6 +47,16 @@ CONCURRENT_CLIENT_COUNT = 32
 CONCURRENT_PAYLOAD_BYTES = 64 * 1024
 REPEATED_CONNECTION_COUNT = 200
 
+REAL_STRACE_SAMPLE = """\
+1072183 11:12:07.480902 sendto(5, "0123456789abcdef"..., 274432, MSG_NOSIGNAL, NULL, 0) = 8192
+1072183 11:12:07.480956 sendto(5, "0123456789abcdef"..., 266240, MSG_NOSIGNAL, NULL, 0) = 4096
+1072183 11:12:07.481832 sendto(5, "0123456789abcdef"..., 176128, MSG_NOSIGNAL, NULL, 0) = -1 EAGAIN (Resource temporarily unavailable)
+1072183 11:12:07.481877 epoll_ctl(4, EPOLL_CTL_MOD, 5, {events=EPOLLIN|EPOLLOUT|EPOLLRDHUP, data={u32=5, u64=5}}) = 0
+1072183 11:12:07.481915 epoll_wait(4, [{events=EPOLLOUT, data={u32=5, u64=5}}], 10, -1) = 1
+1072183 11:12:07.484743 sendto(5, "0123456789abcdef"..., 176128, MSG_NOSIGNAL, NULL, 0) = 176128
+1072183 11:12:07.484965 epoll_ctl(4, EPOLL_CTL_MOD, 5, {events=EPOLLIN|EPOLLRDHUP, data={u32=5, u64=5}}) = 0
+"""
+
 
 def patterned_payload(size: int) -> bytes:
     """Return deterministic binary data of the requested size."""
@@ -64,17 +74,52 @@ def send_all(sock: socket.socket, data: bytes) -> None:
         view = view[sent:]
 
 
+def parse_send_arguments(
+    syscall_name: str, arguments: str
+) -> Optional[Tuple[int, int]]:
+    """Extract FD and buffer length from strace send/sendto arguments."""
+    parts = [part.strip() for part in arguments.rsplit(",", 5)]
+
+    # glibc send() on Linux is traced as:
+    # sendto(fd, buffer, length, flags, destination_address, address_length)
+    # The destination is normally NULL with address_length 0.
+    if (
+        syscall_name == "sendto"
+        and len(parts) == 6
+        and parts[2].isdigit()
+        and parts[5].isdigit()
+    ):
+        fd_field = parts[0]
+        length_field = parts[2]
+    else:
+        parts = [part.strip() for part in arguments.rsplit(",", 3)]
+        if len(parts) != 4 or not parts[2].isdigit():
+            return None
+        fd_field = parts[0]
+        length_field = parts[2]
+
+    fd_match = re.match(r"^(?P<fd>\d+)", fd_field)
+    if not fd_match:
+        return None
+    return int(fd_match.group("fd")), int(length_field)
+
+
 def parse_send_calls(trace_text: str) -> Dict[str, object]:
-    """Analyze all send syscall records while tolerating strace flag layouts."""
+    """Analyze all send syscall records while tolerating strace layouts."""
     partial_sends: List[Tuple[int, int]] = []
+    send_calls: List[Dict[str, object]] = []
+    partial_send_calls: List[Dict[str, object]] = []
+    send_eagain_calls: List[Dict[str, object]] = []
+    send_other_error_calls: List[Dict[str, object]] = []
     eagain_indices: List[int] = []
     other_error_indices: List[int] = []
     send_line_indices: List[int] = []
     full_send_count = 0
     parsed_send_count = 0
     call_pattern = re.compile(r"\b(?:sendto|send)\(")
-    head_pattern = re.compile(r"\b(?:sendto|send)\((.*)\)$")
-    length_pattern = re.compile(r",\s*(?P<length>\d+),\s*[^,]*\s*$")
+    head_pattern = re.compile(
+        r"\b(?P<syscall>sendto|send)\((?P<arguments>.*)\)$"
+    )
     result_pattern = re.compile(r"\s*(?P<result>-?\d+)(?P<tail>.*)$")
 
     for index, line in enumerate(trace_text.splitlines()):
@@ -90,33 +135,111 @@ def parse_send_calls(trace_text: str) -> Dict[str, object]:
         if not head_match:
             continue
 
-        length_match = length_pattern.search(head_match.group(1))
+        parsed_arguments = parse_send_arguments(
+            head_match.group("syscall"), head_match.group("arguments")
+        )
         result_match = result_pattern.match(result_text)
-        if not length_match or not result_match:
+        if parsed_arguments is None or not result_match:
             continue
 
         parsed_send_count += 1
-        requested = int(length_match.group("length"))
+        fd, requested = parsed_arguments
         result = int(result_match.group("result"))
         tail = result_match.group("tail")
+        send_call = {
+            "line_index": index,
+            "fd": fd,
+            "requested": requested,
+            "result": result,
+        }
+        send_calls.append(send_call)
 
         if result > 0 and result == requested:
+            send_call["outcome"] = "full"
             full_send_count += 1
         elif 0 < result < requested:
+            send_call["outcome"] = "partial"
             partial_sends.append((requested, result))
+            partial_send_calls.append(send_call)
         elif result == -1 and ("EAGAIN" in tail or "EWOULDBLOCK" in tail):
+            send_call["outcome"] = "eagain"
             eagain_indices.append(index)
+            send_eagain_calls.append(send_call)
         elif result < 0:
+            send_call["outcome"] = "error"
             other_error_indices.append(index)
+            send_other_error_calls.append(send_call)
+        else:
+            send_call["outcome"] = "other"
 
     return {
         "send_line_count": len(send_line_indices),
         "parsed_send_count": parsed_send_count,
         "full_send_count": full_send_count,
+        "send_calls": send_calls,
         "partial_sends": partial_sends,
+        "partial_send_calls": partial_send_calls,
         "send_eagain_indices": eagain_indices,
+        "send_eagain_calls": send_eagain_calls,
         "send_other_error_indices": other_error_indices,
+        "send_other_error_calls": send_other_error_calls,
     }
+
+
+def parse_epollout_mod_updates(trace_text: str) -> List[Dict[str, int]]:
+    """Return EPOLLOUT MOD updates with the monitored socket FD."""
+    pattern = re.compile(
+        r"\bepoll_ctl\(\s*\d+,\s*EPOLL_CTL_MOD,\s*(?P<fd>\d+),"
+        r".*EPOLLOUT"
+    )
+    updates: List[Dict[str, int]] = []
+    for index, line in enumerate(trace_text.splitlines()):
+        match = pattern.search(line)
+        if match:
+            updates.append(
+                {"line_index": index, "target_fd": int(match.group("fd"))}
+            )
+    return updates
+
+
+def parse_epollout_notifications(trace_text: str) -> List[Dict[str, int]]:
+    """Return EPOLLOUT-ready notifications and their associated socket FD."""
+    pattern = re.compile(
+        r"\bepoll_wait\(.*?events=[A-Z0-9_|]*EPOLLOUT[A-Z0-9_|]*"
+        r".*?data=\{u32=(?P<fd>\d+)"
+    )
+    notifications: List[Dict[str, int]] = []
+    for index, line in enumerate(trace_text.splitlines()):
+        match = pattern.search(line)
+        if match:
+            notifications.append(
+                {"line_index": index, "target_fd": int(match.group("fd"))}
+            )
+    return notifications
+
+
+def find_eagain_epollout_transition(
+    send_evidence: Dict[str, object],
+    epollout_updates: List[Dict[str, int]],
+) -> Optional[Dict[str, int]]:
+    """Find a same-FD EPOLLOUT MOD shortly after a send EAGAIN."""
+    send_eagain_calls = send_evidence["send_eagain_calls"]
+    for send_call in send_eagain_calls:
+        send_index = int(send_call["line_index"])
+        send_fd = int(send_call["fd"])
+        for update in epollout_updates:
+            update_index = int(update["line_index"])
+            update_fd = int(update["target_fd"])
+            if (
+                send_fd == update_fd
+                and send_index < update_index <= send_index + 50
+            ):
+                return {
+                    "send_fd": send_fd,
+                    "send_line_index": send_index,
+                    "update_line_index": update_index,
+                }
+    return None
 
 
 def port_is_available(port: int) -> bool:
@@ -766,16 +889,80 @@ class EchoIntegrationTests(unittest.TestCase):
             and "= -1" in line
             and ("EAGAIN" in line or "EWOULDBLOCK" in line)
         ]
+        epollout_updates = parse_epollout_mod_updates(trace_text)
+        epollout_notifications = parse_epollout_notifications(trace_text)
+        evidence["epollout_updates"] = epollout_updates
+        evidence["epollout_notifications"] = epollout_notifications
         evidence["epollout_update_indices"] = [
-            index
-            for index, line in enumerate(lines)
-            if "epoll_ctl(" in line
-            and "EPOLL_CTL_MOD" in line
-            and "EPOLLOUT" in line
+            int(update["line_index"]) for update in epollout_updates
         ]
         return evidence, trace_text
 
     def test_12_straced_internal_paths(self) -> None:
+        sample_evidence = parse_send_calls(REAL_STRACE_SAMPLE)
+        sample_epollout_updates = parse_epollout_mod_updates(REAL_STRACE_SAMPLE)
+        sample_epollout_notifications = parse_epollout_notifications(
+            REAL_STRACE_SAMPLE
+        )
+        sample_transition = find_eagain_epollout_transition(
+            sample_evidence, sample_epollout_updates
+        )
+
+        self.assertEqual(sample_evidence["send_line_count"], 4)
+        self.assertEqual(sample_evidence["parsed_send_count"], 4)
+        self.assertEqual(
+            sample_evidence["partial_sends"],
+            [(274432, 8192), (266240, 4096)],
+        )
+        self.assertEqual(
+            [call["fd"] for call in sample_evidence["partial_send_calls"]],
+            [5, 5],
+        )
+        self.assertEqual(sample_evidence["full_send_count"], 1)
+        self.assertEqual(
+            sample_evidence["send_calls"][-1],
+            {
+                "line_index": 5,
+                "fd": 5,
+                "requested": 176128,
+                "result": 176128,
+                "outcome": "full",
+            },
+        )
+        self.assertEqual(
+            sample_evidence["send_eagain_calls"],
+            [
+                {
+                    "line_index": 2,
+                    "fd": 5,
+                    "requested": 176128,
+                    "result": -1,
+                    "outcome": "eagain",
+                }
+            ],
+        )
+        self.assertEqual(
+            sample_epollout_updates,
+            [{"line_index": 3, "target_fd": 5}],
+        )
+        self.assertEqual(
+            sample_epollout_notifications,
+            [{"line_index": 4, "target_fd": 5}],
+        )
+        self.assertEqual(
+            sample_transition,
+            {
+                "send_fd": 5,
+                "send_line_index": 2,
+                "update_line_index": 3,
+            },
+        )
+        print(
+            "\n[real trace parser sample] send lines=4, parsed=4, partial=2, "
+            "full=1, send EAGAIN=1 on FD 5, EPOLLOUT MOD on FD 5",
+            flush=True,
+        )
+
         if not self.server.strace_path:
             self.skipTest(
                 "strace was unavailable or disabled; internal EAGAIN path "
@@ -791,18 +978,18 @@ class EchoIntegrationTests(unittest.TestCase):
 
         deadline = time.monotonic() + min(self.io_timeout, 5.0)
         while time.monotonic() < deadline:
-            if evidence["send_eagain_indices"] and evidence[
-                "epollout_update_indices"
-            ]:
+            if find_eagain_epollout_transition(
+                evidence, evidence["epollout_updates"]
+            ):
                 break
             time.sleep(0.1)
             evidence, trace_text = self.collect_trace_evidence(trace_offset)
 
         # Do not depend on unittest method ordering. If earlier tests did not
         # produce trace evidence, repeat the workload here.
-        if not evidence["send_eagain_indices"] or not evidence[
-            "epollout_update_indices"
-        ]:
+        if not find_eagain_epollout_transition(
+            evidence, evidence["epollout_updates"]
+        ):
             trace_offset = self.server.trace_size()
             type(self).backpressure_trace_offset = trace_offset
             payload = (
@@ -821,18 +1008,16 @@ class EchoIntegrationTests(unittest.TestCase):
             deadline = time.monotonic() + min(self.io_timeout, 5.0)
             while time.monotonic() < deadline:
                 evidence, trace_text = self.collect_trace_evidence(trace_offset)
-                if evidence["send_eagain_indices"] and evidence[
-                    "epollout_update_indices"
-                ]:
+                if find_eagain_epollout_transition(
+                    evidence, evidence["epollout_updates"]
+                ):
                     break
                 time.sleep(0.1)
 
-        send_eagain_indices = evidence["send_eagain_indices"]
-        epollout_updates = evidence["epollout_update_indices"]
-        eagain_then_epollout = any(
-            eagain_index < epollout_index <= eagain_index + 50
-            for eagain_index in send_eagain_indices
-            for epollout_index in epollout_updates
+        send_eagain_calls = evidence["send_eagain_calls"]
+        epollout_updates = evidence["epollout_updates"]
+        eagain_then_epollout = find_eagain_epollout_transition(
+            evidence, epollout_updates
         )
 
         trace_lines = trace_text.splitlines()
@@ -864,12 +1049,19 @@ class EchoIntegrationTests(unittest.TestCase):
             "full_send_count": evidence["full_send_count"],
             "partial_send_count": len(evidence["partial_sends"]),
             "partial_sends": evidence["partial_sends"][:20],
-            "send_eagain_count": len(send_eagain_indices),
+            "partial_send_calls": evidence["partial_send_calls"][:20],
+            "send_eagain_count": len(send_eagain_calls),
+            "send_eagain_calls": send_eagain_calls[:20],
             "send_other_error_count": len(
                 evidence["send_other_error_indices"]
             ),
             "recv_eagain_count": len(evidence["recv_eagain_indices"]),
             "epollout_mod_count": len(epollout_updates),
+            "epollout_notification_count": len(
+                evidence["epollout_notifications"]
+            ),
+            "epollout_updates": epollout_updates[:20],
+            "epollout_notifications": evidence["epollout_notifications"][:20],
             "eagain_then_epollout": eagain_then_epollout,
             "send_samples": send_samples,
             "send_eagain_samples": send_eagain_samples,
@@ -889,7 +1081,7 @@ class EchoIntegrationTests(unittest.TestCase):
                 evidence["parsed_send_count"],
                 evidence["full_send_count"],
                 len(evidence["partial_sends"]),
-                len(send_eagain_indices),
+                len(send_eagain_calls),
                 len(evidence["recv_eagain_indices"]),
                 len(epollout_updates),
                 self.server.trace_path,
@@ -906,7 +1098,7 @@ class EchoIntegrationTests(unittest.TestCase):
             ),
         )
         self.assertTrue(
-            send_eagain_indices,
+            send_eagain_calls,
             "no send EAGAIN was observed; send lines={}, parsed sends={}; "
             "raw trace: {}".format(
                 evidence["send_line_count"],
@@ -922,7 +1114,7 @@ class EchoIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(
             eagain_then_epollout,
-            "send EAGAIN was not followed by an EPOLLOUT EPOLL_CTL_MOD; "
+            "no same-FD EPOLLOUT EPOLL_CTL_MOD followed send EAGAIN; "
             "raw trace: {}".format(self.server.trace_path),
         )
 
